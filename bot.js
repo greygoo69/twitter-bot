@@ -1,171 +1,240 @@
-// Node 20+ (Actions runner has it). No external deps.
+// bot.js — VVV watcher + tweet (Twitter v2 via OAuth 1.0a; no deps)
 
-const crypto = await import("node:crypto");
-const API_URL = process.env.API_URL || "https://www.vvv.so/api/get-top-collections";
-const TEXT_TEMPLATE = process.env.TEXT_TEMPLATE || "New VVV collection: %%NAME%% — %%URL%% #Solana #NFTs";
-const MAX_TWEETS_PER_RUN = parseInt(process.env.MAX_TWEETS_PER_RUN || "3", 10);
-const INCLUDE_COMING_SOON = (process.env.INCLUDE_COMING_SOON || "false") === "true";
+import crypto from "node:crypto";
 
-// --- OAuth1 for Twitter v1.1 statuses/update.json ---
-const enc = (s) =>
-  encodeURIComponent(s).replace(/[!*()']/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
+// ---------- ENV ----------
+const env = (k, d = "") => (process.env[k] ?? d).toString().trim();
 
-function oauthHeader({ method, url, consumerKey, consumerSecret, token, tokenSecret, formParams = {} }) {
+const API_URL = env("API_URL", "https://www.vvv.so/api/get-top-collections");
+const TEXT_TEMPLATE = env("TEXT_TEMPLATE", "New VVV collection: %%NAME%% (%%SIZE%%) — %%URL%%");
+const MAX_TWEETS_PER_RUN = Number(env("MAX_TWEETS_PER_RUN", "3")) || 3;
+const INCLUDE_COMING_SOON = /^true$/i.test(env("INCLUDE_COMING_SOON", "false"));
+
+const GIST_ID = env("GIST_ID");
+const GIST_TOKEN = env("GIST_TOKEN");
+
+const X_KEYS = {
+  consumerKey: env("X_API_KEY"),
+  consumerSecret: env("X_API_SECRET"),
+  accessToken: env("X_ACCESS_TOKEN"),
+  accessSecret: env("X_ACCESS_SECRET"),
+};
+
+// ---------- SMALL UTILS ----------
+const enc = (s = "") =>
+  encodeURIComponent(s).replace(/[!*()']/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function truncateTweet(s, limit = 280) {
+  if (s.length <= limit) return s;
+  return s.slice(0, limit - 1).trimEnd() + "…";
+}
+
+// Build OAuth 1.0a Authorization header (HMAC-SHA1)
+function oauthHeader({ method, url, consumerKey, consumerSecret, accessToken, accessSecret }) {
+  const u = new URL(url);
   const oauth = {
     oauth_consumer_key: consumerKey,
     oauth_nonce: crypto.randomBytes(16).toString("hex"),
     oauth_signature_method: "HMAC-SHA1",
     oauth_timestamp: Math.floor(Date.now() / 1000).toString(),
-    oauth_token: token,
+    oauth_token: accessToken,
     oauth_version: "1.0",
   };
-  const baseParams = { ...oauth, ...formParams };
-  const norm = Object.keys(baseParams)
+
+  // Base string params: query + oauth (JSON body is NOT included)
+  const params = {};
+  for (const [k, v] of u.searchParams) params[k] = v;
+  Object.assign(params, oauth);
+
+  const paramStr = Object.keys(params)
     .sort()
-    .map((k) => `${enc(k)}=${enc(baseParams[k])}`)
+    .map((k) => `${enc(k)}=${enc(params[k])}`)
     .join("&");
-  const baseString = [method.toUpperCase(), enc(url), enc(norm)].join("&");
-  const signingKey = `${enc(consumerSecret)}&${enc(tokenSecret)}`;
-  const signature = crypto.createHmac("sha1", signingKey).update(baseString).digest("base64");
-  const auth = { ...oauth, oauth_signature: signature };
-  return "OAuth " + Object.keys(auth).sort().map((k) => `${enc(k)}="${enc(auth[k])}"`).join(", ");
+
+  const base = [method.toUpperCase(), enc(u.origin + u.pathname), enc(paramStr)].join("&");
+  const signingKey = `${enc(consumerSecret)}&${enc(accessSecret)}`;
+  const signature = crypto.createHmac("sha1", signingKey).update(base).digest("base64");
+
+  oauth.oauth_signature = signature;
+
+  return (
+    "OAuth " +
+    Object.keys(oauth)
+      .sort()
+      .map((k) => `${enc(k)}="${enc(oauth[k])}"`)
+      .join(", ")
+  );
 }
 
-async function postTweetV11(status) {
-  const endpoint = "https://api.twitter.com/1.1/statuses/update.json";
-  const form = { status };
-  const headers = {
-    Authorization: oauthHeader({
-      method: "POST",
-      url: endpoint,
-      consumerKey: process.env.X_API_KEY,
-      consumerSecret: process.env.X_API_SECRET,
-      token: process.env.X_ACCESS_TOKEN,
-      tokenSecret: process.env.X_ACCESS_SECRET,
-      formParams: form,
-    }),
-    "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-    "User-Agent": "vvv-bot/1.0",
-  };
-  const body = new URLSearchParams(form).toString();
-  const r = await fetch(endpoint, { method: "POST", headers, body });
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`tweet failed ${r.status}: ${t}`);
-  }
-  const j = await r.json();
-  return j?.id_str || j?.id;
+// ---------- TWITTER HELPERS (v2 tweeting, v1.1 verify) ----------
+const TW_V1_VERIFY = "https://api.twitter.com/1.1/account/verify_credentials.json";
+const TW_V2_TWEETS = "https://api.twitter.com/2/tweets";
+
+async function verifyAuth() {
+  const auth = oauthHeader({ method: "GET", url: TW_V1_VERIFY, ...X_KEYS });
+  const r = await fetch(TW_V1_VERIFY, { headers: { Authorization: auth } });
+  const body = await r.text();
+  if (!r.ok) throw new Error(`verify failed ${r.status}: ${body}`);
+  console.log("auth ok; access-level:", r.headers.get("x-access-level") || "unknown");
 }
 
-const truncate = (s, max = 280) => (s.length <= max ? s : s.slice(0, max - 1) + "…");
-
-// --- Gist state helpers ---
-async function readGistArray(gistId, filename, token) {
-  const gh = "https://api.github.com";
-  const meta = await fetch(`${gh}/gists/${gistId}`, {
-    headers: { Authorization: `Bearer ${token}`, "User-Agent": "vvv-bot" },
+async function postTweet(text) {
+  const auth = oauthHeader({ method: "POST", url: TW_V2_TWEETS, ...X_KEYS });
+  const r = await fetch(TW_V2_TWEETS, {
+    method: "POST",
+    headers: { Authorization: auth, "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
   });
-  if (!meta.ok) throw new Error(`gist meta ${meta.status}`);
-  const info = await meta.json();
-  const rawUrl = info?.files?.[filename]?.raw_url;
-  if (!rawUrl) return [];
-  const fileRes = await fetch(rawUrl, { headers: { "User-Agent": "vvv-bot" } });
-  if (!fileRes.ok) return [];
+  const t = await r.text();
+  if (!r.ok) throw new Error(`tweet failed ${r.status}: ${t}`);
+  const j = JSON.parse(t);
+  return j?.data?.id;
+}
+
+// ---------- GIST STATE (known IDs) ----------
+const GIST_FILE = "state.json";
+
+async function loadKnownIds() {
+  if (!GIST_ID || !GIST_TOKEN) return new Set();
+  const r = await fetch(`https://api.github.com/gists/${GIST_ID}`, {
+    headers: { Authorization: `token ${GIST_TOKEN}`, Accept: "application/vnd.github+json" },
+  });
+  if (!r.ok) throw new Error(`gist read failed ${r.status}`);
+  const j = await r.json();
+  const file = j.files?.[GIST_FILE];
+  if (!file || !file.content) return new Set();
   try {
-    return JSON.parse(await fileRes.text());
+    const arr = JSON.parse(file.content);
+    return new Set(Array.isArray(arr) ? arr : []);
   } catch {
-    return [];
+    return new Set();
   }
 }
 
-async function writeGistArray(gistId, filename, token, array) {
-  const gh = "https://api.github.com";
-  const body = {
-    files: {
-      [filename]: { content: JSON.stringify(array, null, 2) },
-    },
-  };
-  const r = await fetch(`${gh}/gists/${gistId}`, {
+async function saveKnownIds(idsSet) {
+  if (!GIST_ID || !GIST_TOKEN) return;
+  const content = JSON.stringify([...idsSet], null, 0);
+  const r = await fetch(`https://api.github.com/gists/${GIST_ID}`, {
     method: "PATCH",
     headers: {
-      Authorization: `Bearer ${token}`,
+      Authorization: `token ${GIST_TOKEN}`,
+      Accept: "application/vnd.github+json",
       "Content-Type": "application/json",
-      "User-Agent": "vvv-bot",
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ files: { [GIST_FILE]: { content } } }),
   });
-  if (!r.ok) throw new Error(`gist write ${r.status}: ${await r.text()}`);
+  if (!r.ok) throw new Error(`gist write failed ${r.status}`);
 }
 
-function normalizeCollections(payload) {
-  let list = Array.isArray(payload?.collections) ? payload.collections : [];
-  if (!INCLUDE_COMING_SOON) list = list.filter((c) => !c.coming_soon);
-
-  return list
-    .map((c) => {
-      const slug = c.slug || "";
-      const id = slug || c.collection_nft_pub_key || c.name || "";
-      if (!id) return null;
-      return {
-        id,
-        name: (c.name || (slug ? slug.replace(/[-_]/g, " ") : "Unknown")).trim(),
-        size: c.collection_size ?? "",
-        img: c.collection_image_url ?? "",
-        pubkey: c.collection_nft_pub_key ?? "",
-        slug,
-        url: slug ? `https://www.vvv.so/collection/${slug}` : (c.external_url || "https://www.vvv.so/"),
-      };
-    })
-    .filter(Boolean);
+// ---------- VVV FETCH + NORMALIZE ----------
+function vvvUrl(col) {
+  if (col.slug) return `https://www.vvv.so/collection/${col.slug}`;
+  if (col.external_url) return col.external_url;
+  return "https://www.vvv.so/";
 }
 
-function render(template, row) {
-  return template
-    .replaceAll("%%NAME%%", row.name)
-    .replaceAll("%%SIZE%%", String(row.size ?? ""))
-    .replaceAll("%%IMG%%", row.img)
-    .replaceAll("%%PUBKEY%%", row.pubkey)
-    .replaceAll("%%SLUG%%", row.slug)
-    .replaceAll("%%URL%%", row.url);
+function normalize(col) {
+  const id = col.slug || col.collection_nft_pub_key || col.name || crypto.randomUUID();
+  return {
+    id: String(id),
+    slug: col.slug ?? "",
+    name: col.name ?? "",
+    size: col.collection_size ?? "",
+    img: col.collection_image_url ?? "",
+    pubkey: col.collection_nft_pub_key ?? "",
+    url: vvvUrl(col),
+    comingSoon: !!col.coming_soon,
+    raw: col,
+  };
 }
 
-// ---- main ----
-(async () => {
-  for (const k of ["GIST_ID", "GIST_TOKEN", "X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_SECRET"]) {
-    if (!process.env[k]) throw new Error(`Missing env: ${k}`);
+function formatText(tpl, col) {
+  const map = {
+    "%%NAME%%": col.name ?? "",
+    "%%SIZE%%": col.size ?? "",
+    "%%URL%%": col.url ?? "",
+    "%%IMG%%": col.img ?? "",
+    "%%PUBKEY%%": col.pubkey ?? "",
+    "%%SLUG%%": col.slug ?? "",
+  };
+  return Object.entries(map).reduce((s, [k, v]) => s.replaceAll(k, String(v)), tpl);
+}
+
+async function fetchCollections() {
+  const r = await fetch(API_URL, { headers: { "User-Agent": "vvv-watcher-bot" } });
+  const j = await r.json();
+  if (!r.ok || !j?.collections) throw new Error(`fetch failed ${r.status}`);
+  const arr = j.collections.map(normalize);
+  return INCLUDE_COMING_SOON ? arr : arr.filter((c) => !c.comingSoon);
+}
+
+// ---------- MAIN ----------
+async function main() {
+  // Basic sanity
+  for (const [k, v] of Object.entries(X_KEYS)) {
+    if (!v) throw new Error(`missing Twitter secret: ${k}`);
+  }
+  if (!GIST_ID || !GIST_TOKEN) {
+    console.warn("⚠️  No Gist state configured (GIST_ID / GIST_TOKEN). Bot will not remember IDs.");
   }
 
-  const res = await fetch(API_URL, { headers: { accept: "application/json", "User-Agent": "vvv-bot" } });
-  if (!res.ok) throw new Error(`fetch ${res.status}`);
-  const payload = await res.json();
+  // Verify auth (also prints x-access-level header)
+  await verifyAuth();
 
-  const rows = normalizeCollections(payload);
-  const currentIds = rows.map((r) => r.id);
+  const cols = await fetchCollections();
+  const currentIds = new Set(cols.map((c) => c.id));
 
-  const filename = "vvv-known-ids.json";
-  let knownIds = await readGistArray(process.env.GIST_ID, filename, process.env.GIST_TOKEN);
-  if (!Array.isArray(knownIds)) knownIds = [];
-
-  const firstRun = knownIds.length === 0;
-  const knownSet = new Set(knownIds);
-  const fresh = rows.filter((r) => !knownSet.has(r.id));
-
-  // persist union
-  await writeGistArray(process.env.GIST_ID, filename, process.env.GIST_TOKEN, Array.from(new Set([...knownIds, ...currentIds])));
+  const known = await loadKnownIds();
+  const firstRun = known.size === 0;
 
   if (firstRun) {
-    console.log(`Seeded ${currentIds.length} ids on first run; not tweeting.`);
-    return;
-  }
-  const toPost = fresh.slice(0, MAX_TWEETS_PER_RUN);
-  if (!toPost.length) {
-    console.log("No new collections");
-    return;
+    // Seed state, don't tweet
+    for (const id of currentIds) known.add(id);
+    await saveKnownIds(known);
+    console.log(`Seeded ${currentIds.size} ids on first run; not tweeting.`);
+    return { seeded: currentIds.size, posted: 0 };
   }
 
-  for (const r of toPost) {
-    const text = truncate(render(TEXT_TEMPLATE, r), 280);
-    const id = await postTweetV11(text);
-    console.log(`Tweeted (${id}): ${text}`);
+  // Diff
+  const fresh = cols.filter((c) => !known.has(c.id));
+  if (fresh.length === 0) {
+    console.log("No new collections");
+    return { posted: 0, note: "No new collections" };
   }
-})();
+
+  const toPost = fresh.slice(0, MAX_TWEETS_PER_RUN);
+  let posted = 0;
+
+  for (const col of toPost) {
+    let text = formatText(TEXT_TEMPLATE, col);
+    text = truncateTweet(text, 280);
+
+    try {
+      const id = await postTweet(text);
+      posted += 1;
+      console.log(`tweeted ${id}: ${text}`);
+      // Gentle gap to avoid rate spikes
+      await sleep(800);
+    } catch (err) {
+      console.error("tweet error:", err?.message || err);
+    }
+  }
+
+  // Update known ids (union with current)
+  const union = new Set([...known, ...currentIds]);
+  await saveKnownIds(union);
+
+  return { posted, queued: fresh.length, keptKnown: union.size };
+}
+
+// Run
+main()
+  .then((res) => {
+    console.log(JSON.stringify(res, null, 2));
+  })
+  .catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
