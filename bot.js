@@ -130,7 +130,7 @@ async function saveKnownIds(idsSet) {
 
 // ---------- VVV FETCH + NORMALIZE ----------
 function vvvUrl(col) {
-  if (col.slug) return `https://www.vvv.so/collection/${col.slug}`;
+  if (col.slug) return `https://www.vvv.so/${col.slug}`;
   if (col.external_url) return col.external_url;
   return "https://www.vvv.so/";
 }
