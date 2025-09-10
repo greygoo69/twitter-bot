@@ -6,7 +6,7 @@ import crypto from "node:crypto";
 const env = (k, d = "") => (process.env[k] ?? d).toString().trim();
 
 const API_URL = env("API_URL", "https://www.vvv.so/api/get-top-collections");
-const TEXT_TEMPLATE = env("TEXT_TEMPLATE", "New VVV collection: %%NAME%% (%%SIZE%%) — %%URL%%");
+const TEXT_TEMPLATE="🚨 New NFT Drop 🚨\n\n✨ Name: %%NAME%%\n✨ Supply: %%SIZE%%\n✨ Link: %%URL%%";
 const MAX_TWEETS_PER_RUN = Number(env("MAX_TWEETS_PER_RUN", "3")) || 3;
 const INCLUDE_COMING_SOON = /^true$/i.test(env("INCLUDE_COMING_SOON", "false"));
 
